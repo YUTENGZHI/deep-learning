@@ -1,0 +1,158 @@
+#include <iostream>
+#include "opencv2/opencv.hpp"
+
+using namespace std;
+using namespace cv;
+
+
+// 定义一个人脸检测类(FaceDetectorYN)对象，并加载对应的模型
+Ptr< FaceDetectorYN > fd = FaceDetectorYN::create("./models/yunet.onnx", "", Size(320, 320));
+Ptr< FaceRecognizerSF > fr = FaceRecognizerSF::create("./models/face_recognizer_fast.onnx", "");
+map<string, Mat> face_db;  // 存放所有已注册的人名和对应人脸的特征向量，相当于一个人脸数据库
+
+
+void register_face();
+string recognize_face(Mat img, Mat face);
+
+
+int main()
+{
+    VideoCapture camera(0);  // 定义一个 VideoCapture 类的对象，就是系统中默认摄像头（索引为 0）对象，如果想打开其他摄像头，就使用 1、2 等索引
+    
+    if(!camera.isOpened())
+    {
+        cerr << "摄像头打开失败！" << endl;
+        return 1;
+    }
+
+    double fps, width, height;
+
+    fps = camera.get(CAP_PROP_FPS);
+    width = camera.get(CAP_PROP_FRAME_WIDTH);
+    height = camera.get(CAP_PROP_FRAME_HEIGHT);
+
+    Mat img;  // 定义一个 Mat 对象（即矩阵），用于存放摄像头采集的一帧图像数据
+    Mat watermark, result, faces;
+    int ret, r, x, y, w, h, nose_x, nose_y;
+
+    watermark = imread("./watermark.png");
+
+    register_face();
+
+    while(1)
+    {
+        if(camera.read(img))  // 调用 camera 对象的 read 方法，从摄像头读取一帧图像并存放在 img 矩阵对象中
+        {
+            fd->setInputSize(img.size());
+            fd->detect(img, faces);  // 通过深度神经网络分析出人脸区域
+
+            for(r = 0; r < faces.rows; r++)  // 每个人脸占一行
+            {
+                // 人脸区域左上角坐标、宽度、高度、右眼坐标、左眼坐标、鼻子坐标、右嘴角坐标、左嘴角坐标、置信度
+                x = faces.at<float>(r, 0);
+                y = faces.at<float>(r, 1);
+                w = faces.at<float>(r, 2);
+                h = faces.at<float>(r, 3);
+
+                nose_x = faces.at<float>(r, 8);
+                nose_y = faces.at<float>(r, 9);
+
+                string name = recognize_face(img, faces.row(r));
+
+                // 将检测出的人脸区域用矩形框标注出来
+                rectangle(img, Rect(x, y, w, h), Scalar(0, 255, 0), 2);
+
+                // 显示人名
+                putText(img, name, Point(x, y - 10), FONT_HERSHEY_SIMPLEX, 1, Scalar(0, 0, 255), 2);
+
+                // 红鼻子效果
+                //circle(img, Point(nose_x, nose_y), 10, Scalar(0, 0, 255), -1);
+            }
+
+            addWeighted(img, 0.7, watermark, 0.3, 0, result);  // 将两帧图像进行叠加(带权值)
+
+            imshow("摄像头", result);  // 将 img 图像显示在名字为"摄像头"的窗口中
+        }
+        else
+        {
+            cerr << "读取摄像头失败！" << endl;
+            break;
+        }
+
+        ret = waitKey(1);  // 等待 1 毫秒
+
+        if(ret == 27) break;  // 当用户按下键盘上的 ESC 键时，waitKey 函数返回值为 27
+    }
+
+    camera.release();  // 释放摄像头    
+
+    return 0;
+}
+
+
+// 注册人脸
+void register_face()
+{
+    string face_dir = "./faces";
+    vector<string> face_path;
+
+    glob(face_dir, face_path);  // 遍历某个文件夹下的所有文件，将它们的路径保存到 vector 容器中
+
+    for(auto s : face_path)
+    {
+        cout << s << endl;
+
+        Mat img = imread(s);
+        Mat face;
+
+        //cout << img.size() << endl;
+
+        // 如果人脸图片尺寸很大就调小一点（宽高比不变）
+        if(img.size().width > 1024)
+        {
+            int new_height = img.size().height * 1024 / img.size().width;
+
+            resize(img, img, Size(1024, new_height));
+        }
+
+        //cout << img.size() << endl;
+
+        fd->setInputSize(img.size());
+        fd->detect(img, face);  // 通过深度神经网络分析出人脸区域    
+
+        Mat aligned_img;  // 用于存放对齐和裁剪之后的人脸图像
+        fr->alignCrop(img, face.row(0), aligned_img);  // 进行对齐和裁剪操作
+
+        Mat feature;
+        fr->feature(aligned_img, feature);  // 提取人脸特征向量（128 点）
+
+        // 从人脸图片文件路径中提取主文件名
+        int start = s.rfind('/');
+        int end = s.rfind('.');
+        string name = s.substr(start + 1, end - start - 1);
+        cout << name << endl;
+
+        // 图片文件的主文件名就是对应人的名字，将人名和对应的人脸特征向量存放在 map 容器中
+        face_db[name] = feature.clone();
+    }
+}
+
+
+// 识别人脸
+string recognize_face(Mat img, Mat face)
+{
+    Mat aligned_img;  // 用于存放对齐和裁剪之后的人脸图像
+    fr->alignCrop(img, face, aligned_img);  // 进行对齐和裁剪操作
+
+    Mat feature;
+    fr->feature(aligned_img, feature);  // 提取人脸特征向量（128 点）
+
+    for(auto f : face_db)
+    {
+        double cosine_score = fr->match(feature, f.second);  // 比较两个特征向量（采用余弦距离），获得相似度（0 - 1），值越大相似度越高
+
+        if(cosine_score > 0.363)
+            return f.first;
+    }
+
+    return "unknow";
